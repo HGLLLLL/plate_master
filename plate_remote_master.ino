@@ -4,8 +4,7 @@
 #include "freertos/task.h"
 #include <math.h>
 
-// ================= 腳位定義 =================
-
+// ================= 腳位定義 (保持不變) =================
 #define ENA_RF 13
 #define IN1_RF 14
 #define IN2_RF 12
@@ -43,11 +42,12 @@ unsigned long previousMillis = 0;
 const int reportInterval = 50; 
 const float MAX_RPM = 230.0; 
 
-// ================= 搖桿曲線與死區 =================
+// ================= 搖桿曲線與靈敏度死區 =================
 const float K1_X = 0.15, K1_Y = 0.50;   
 const float K2_X = 0.80, K2_Y = 0.50;   
 const int DEADZONE_PS4 = 15; 
 const float STEER_SENSITIVITY = 0.4; 
+const float THROTTLE_SENSITIVITY = 0.8;
 
 // ================= PID 控制器結構 =================
 struct MotorPID {
@@ -57,7 +57,7 @@ struct MotorPID {
 };
 
 MotorPID pidLF = {0.7, 0.4, 1.5, 0, 0, 0, 0};
-MotorPID pidLR = {0.5, 0.4, 1.8, 0, 0, 0, 0};
+MotorPID pidLR = {0.7, 0.4, 1.5, 0, 0, 0, 0};
 MotorPID pidRF = {0.7, 0.4, 1.5, 0, 0, 0, 0};
 MotorPID pidRR = {0.7, 0.4, 1.5, 0, 0, 0, 0};
 
@@ -107,7 +107,7 @@ float applyUserCurve(float x) {
 // ================= 任務：PS4 控制處理 (核心 0) =================
 void Task_Input(void *pvParameters) {
     // 伺服馬達按鍵
-    bool lastBtnLeft = false, lastBtnUp = false, lastBtnRight = false;
+    bool lastBtnUp = false, lastBtnDown = false;
     // 風扇按鍵
     bool lastBtnSquare = false, lastBtnTriangle = false, lastBtnCross = false;
 
@@ -127,34 +127,29 @@ void Task_Input(void *pvParameters) {
             float finalAbsT = (absT < dz_float) ? 0 : applyUserCurve(absT);
             float finalAbsS = (absS < dz_float) ? 0 : applyUserCurve(absS);
 
-            float finalT = (normT >= 0) ? finalAbsT : -finalAbsT;
-            float finalS = (normS >= 0) ? finalAbsS : -finalAbsS;
+            // 套用油門與轉向靈敏度
+            float finalT = ((normT >= 0) ? finalAbsT : -finalAbsT) * THROTTLE_SENSITIVITY;
+            float finalS = ((normS >= 0) ? finalAbsS : -finalAbsS) * STEER_SENSITIVITY;
 
-            float steer = finalS * STEER_SENSITIVITY;
-            float leftPower = finalT + steer;
-            float rightPower = finalT - steer;
+            float leftPower = finalT + finalS;
+            float rightPower = finalT - finalS;
 
             float maxVal = fmaxf(1.0f, fmaxf(fabsf(leftPower), fabsf(rightPower)));
             setTargetRPM((leftPower / maxVal) * MAX_RPM, (rightPower / maxVal) * MAX_RPM);
 
-            // --- 2. 伺服馬達控制 (十字鍵) ---
-            bool currLeft = PS4.Left();
+            // --- 2. 伺服馬達控制 (上/下 鍵) ---
             bool currUp = PS4.Up();
-            bool currRight = PS4.Right();
+            bool currDown = PS4.Down();
 
-            if (currLeft && !lastBtnLeft) {
-                Serial2.println("S:0");
-                Serial.println(">> 伺服馬達: 20 度");
-            }
             if (currUp && !lastBtnUp) {
-                Serial2.println("S:270");
-                Serial.println(">> 伺服馬達: 75 度");
+                Serial2.println("S:260");
+                // Serial.println(">> 伺服馬達: 260 度"); 
             }
-            if (currRight && !lastBtnRight) {
-                Serial2.println("S:270");
-                Serial.println(">> 伺服馬達: 150 度");
+            if (currDown && !lastBtnDown) {
+                Serial2.println("S:0");
+                // Serial.println(">> 伺服馬達: 0 度");
             }
-            lastBtnLeft = currLeft; lastBtnUp = currUp; lastBtnRight = currRight;
+            lastBtnUp = currUp; lastBtnDown = currDown;
 
             // --- 3. 函道風扇控制 (形狀鍵) ---
             bool currSquare = PS4.Square();
@@ -163,15 +158,12 @@ void Task_Input(void *pvParameters) {
 
             if (currSquare && !lastBtnSquare) {
                 Serial2.println("F:E");
-                Serial.println(">> 風扇: 解鎖請求");
             }
             if (currTriangle && !lastBtnTriangle) {
                 Serial2.println("F:R");
-                Serial.println(">> 風扇: 啟動轉動");
             }
             if (currCross && !lastBtnCross) {
                 Serial2.println("F:S");
-                Serial.println(">> 風扇: 緊急停止");
             }
             lastBtnSquare = currSquare; lastBtnTriangle = currTriangle; lastBtnCross = currCross;
 
@@ -226,6 +218,10 @@ void loop() {
 
     applyMotorPWM(computePID(pidLF, rpmLF), computePID(pidLR, rpmLR), computePID(pidRF, rpmRF), computePID(pidRR, rpmRR));
     previousMillis = currentMillis;
+
+    // ================= Serial Plotter =================
+    Serial.printf("LF_RPM:%.2f, LR_RPM:%.2f, RF_RPM:%.2f, RR_RPM:%.2f\n", 
+                  pidLF.filteredRPM, pidLR.filteredRPM, pidRF.filteredRPM, pidRR.filteredRPM);
   }
 }
 
