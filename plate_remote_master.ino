@@ -4,7 +4,7 @@
 #include "freertos/task.h"
 #include <math.h>
 
-// ================= 腳位定義 (保持不變) =================
+// ================= 腳位定義 =================
 #define ENA_RF 13
 #define IN1_RF 14
 #define IN2_RF 12
@@ -39,62 +39,70 @@ const unsigned long DEBOUNCE_US = 150;
 
 long prevCountLF = 0, prevCountLR = 0, prevCountRF = 0, prevCountRR = 0;
 unsigned long previousMillis = 0;
-const int reportInterval = 50; 
+const unsigned long reportInterval = 50; 
 const float MAX_RPM = 230.0; 
+
+// ================= 控制模式狀態 =================
+volatile bool pidEnabled = true; // true: 閉迴路 (PID), false: 開迴路 (直接 PWM)
 
 // ================= 搖桿曲線與靈敏度死區 =================
 const float K1_X = 0.15, K1_Y = 0.50;   
 const float K2_X = 0.80, K2_Y = 0.50;   
 const int DEADZONE_PS4 = 15; 
 const float STEER_SENSITIVITY = 0.4; 
-const float THROTTLE_SENSITIVITY = 0.8;
+const float THROTTLE_SENSITIVITY = 1;
+
+// ================= 差速微調參數 =================
+const float TRIM_RPM = 30.0; // L1/R1 微調時增加/減少的目標轉速
 
 // ================= PID 控制器結構 =================
 struct MotorPID {
-  float kp, ki, kd;
-  volatile float setpoint;
-  float integral, prevRPM, filteredRPM;
+    float kp, ki, kd;
+    volatile float setpoint;
+    float integral, prevRPM, filteredRPM;
 };
 
-MotorPID pidLF = {0.7, 0.4, 1.5, 0, 0, 0, 0};
-MotorPID pidLR = {0.7, 0.4, 1.5, 0, 0, 0, 0};
-MotorPID pidRF = {0.7, 0.4, 1.5, 0, 0, 0, 0};
-MotorPID pidRR = {0.7, 0.4, 1.5, 0, 0, 0, 0};
+// 更新為測試後的新參數
+MotorPID pidLF = {0.7, 3.0, 0.08, 0, 0, 0, 0};
+MotorPID pidLR = {0.7, 3.0, 0.08, 0, 0, 0, 0};
+MotorPID pidRF = {0.7, 3.0, 0.08, 0, 0, 0, 0};
+MotorPID pidRR = {0.7, 3.0, 0.08, 0, 0, 0, 0};
 
 // --- 函式宣告 ---
 void setTargetRPM(float leftRPM, float rightRPM);
-int computePID(MotorPID &pid, float currentRPM);
+int computePID(MotorPID &pid, float currentRPM, float dt);
 void applyMotorPWM(int pwmLF, int pwmLR, int pwmRF, int pwmRR);
+void setMotorPWM(int in1, int in2, int en, int pwm);
 float applyUserCurve(float x);
 
-// ISR
+// ================= 外部中斷 (ISR) =================
 void IRAM_ATTR isrLF() {
-  unsigned long now = micros();
-  if (now - lastMicrosLF > DEBOUNCE_US) {
-    if (digitalRead(ENCB_LF) == HIGH) countLF++; else countLF--;
-    lastMicrosLF = now;
-  }
+    unsigned long now = micros();
+    if (now - lastMicrosLF > DEBOUNCE_US) {
+        countLF += (digitalRead(ENCB_LF) == HIGH) ? 1 : -1;
+        lastMicrosLF = now;
+    }
 }
 void IRAM_ATTR isrLR() {
-  unsigned long now = micros();
-  if (now - lastMicrosLR > DEBOUNCE_US) {
-    if (digitalRead(ENCB_LR) == HIGH) countLR++; else countLR--;
-    lastMicrosLR = now;
-  }
+    unsigned long now = micros();
+    if (now - lastMicrosLR > DEBOUNCE_US) {
+        countLR += (digitalRead(ENCB_LR) == HIGH) ? 1 : -1;
+        lastMicrosLR = now;
+    }
 }
 void IRAM_ATTR isrRF() {
-  unsigned long now = micros();
-  if (now - lastMicrosRF > DEBOUNCE_US) {
-    if (digitalRead(ENCB_RF) == HIGH) countRF++; else countRF--;
-    lastMicrosRF = now;
-  }
+    unsigned long now = micros();
+    if (now - lastMicrosRF > DEBOUNCE_US) {
+        countRF += (digitalRead(ENCB_RF) == HIGH) ? 1 : -1;
+        lastMicrosRF = now;
+    }
 }
 void IRAM_ATTR isrRR() {
-  unsigned long now = micros();
-  if (now - lastMicrosRR > DEBOUNCE_US) {
-    if (digitalRead(ENCB_RR) == HIGH) countRR++; else countRR--;
-    lastMicrosRR = now;
-  }
+    unsigned long now = micros();
+    if (now - lastMicrosRR > DEBOUNCE_US) {
+        countRR += (digitalRead(ENCB_RR) == HIGH) ? 1 : -1;
+        lastMicrosRR = now;
+    }
 }
 
 // ================= 搖桿曲線 =================
@@ -104,30 +112,38 @@ float applyUserCurve(float x) {
     else return K2_Y + (1.0 - K2_Y) / (1.0 - K2_X) * (x - K2_X);
 }
 
-// ================= 任務：PS4 控制處理 (核心 0) =================
+// ================= 任務：PS4 控制處理 (Core 0) =================
 void Task_Input(void *pvParameters) {
-    // 伺服馬達按鍵
     bool lastBtnUp = false, lastBtnDown = false;
-    // 風扇按鍵
     bool lastBtnSquare = false, lastBtnTriangle = false, lastBtnCross = false;
+    bool lastBtnCircle = false; //
+    bool lastBtnL2 = false, lastBtnR2 = false; // 保留原有的 Aux 控制
 
     for (;;) {
         if (PS4.isConnected()) {
-            // --- 1. 底盤動力控制 ---
-            int rawY = PS4.LStickY(); 
-            int rawX = PS4.RStickX();
+            // --- 0. 控制模式切換 (圓圈鍵) ---
+            bool currCircle = PS4.Circle();
+            if (currCircle && !lastBtnCircle) {
+                pidEnabled = !pidEnabled; 
+                if (!pidEnabled) {
+                    pidLF.integral = 0; pidLR.integral = 0; 
+                    pidRF.integral = 0; pidRR.integral = 0;
+                }
+                Serial.printf(">> 控制模式: %s\n", pidEnabled ? "PID 閉迴路 (ON)" : "開迴路直接控制 (OFF)");
+            }
+            lastBtnCircle = currCircle;
 
-            float normT = (float)rawY / 128.0;
-            float normS = (float)rawX / 128.0;
+            // --- 1. 底盤動力控制 ---
+            float normT = -(float)PS4.LStickY() / 128.0f;
+            float normS = (float)PS4.RStickX() / 128.0f;
 
             float absT = fabsf(normT);
             float absS = fabsf(normS);
-            float dz_float = (float)DEADZONE_PS4 / 128.0;
+            float dz_float = (float)DEADZONE_PS4 / 128.0f;
             
             float finalAbsT = (absT < dz_float) ? 0 : applyUserCurve(absT);
             float finalAbsS = (absS < dz_float) ? 0 : applyUserCurve(absS);
 
-            // 套用油門與轉向靈敏度
             float finalT = ((normT >= 0) ? finalAbsT : -finalAbsT) * THROTTLE_SENSITIVITY;
             float finalS = ((normS >= 0) ? finalAbsS : -finalAbsS) * STEER_SENSITIVITY;
 
@@ -135,37 +151,52 @@ void Task_Input(void *pvParameters) {
             float rightPower = finalT - finalS;
 
             float maxVal = fmaxf(1.0f, fmaxf(fabsf(leftPower), fabsf(rightPower)));
-            setTargetRPM((leftPower / maxVal) * MAX_RPM, (rightPower / maxVal) * MAX_RPM);
+            
+            float targetLeftRPM = (leftPower / maxVal) * MAX_RPM;
+            float targetRightRPM = (rightPower / maxVal) * MAX_RPM;
 
-            // --- 2. 伺服馬達控制 (上/下 鍵) ---
+            // --- 2. L1/R1 差速微調 ---
+            if (PS4.L1()) {
+                targetLeftRPM -= TRIM_RPM;
+                targetRightRPM += TRIM_RPM;
+            } else if (PS4.R1()) {
+                targetLeftRPM += TRIM_RPM;
+                targetRightRPM -= TRIM_RPM;
+            }
+
+            targetLeftRPM = constrain(targetLeftRPM, -MAX_RPM, MAX_RPM);
+            targetRightRPM = constrain(targetRightRPM, -MAX_RPM, MAX_RPM);
+
+            setTargetRPM(targetLeftRPM, targetRightRPM);
+
+            // --- 3. 伺服馬達與風扇控制 ---
             bool currUp = PS4.Up();
             bool currDown = PS4.Down();
-
-            if (currUp && !lastBtnUp) {
-                Serial2.println("S:260");
-                // Serial.println(">> 伺服馬達: 260 度"); 
-            }
-            if (currDown && !lastBtnDown) {
-                Serial2.println("S:0");
-                // Serial.println(">> 伺服馬達: 0 度");
-            }
+            if (currUp && !lastBtnUp) Serial2.println("S:260");
+            if (currDown && !lastBtnDown) Serial2.println("S:0");
             lastBtnUp = currUp; lastBtnDown = currDown;
 
-            // --- 3. 函道風扇控制 (形狀鍵) ---
             bool currSquare = PS4.Square();
             bool currTriangle = PS4.Triangle();
             bool currCross = PS4.Cross();
-
-            if (currSquare && !lastBtnSquare) {
-                Serial2.println("F:E");
-            }
-            if (currTriangle && !lastBtnTriangle) {
-                Serial2.println("F:R");
-            }
-            if (currCross && !lastBtnCross) {
-                Serial2.println("F:S");
-            }
+            if (currSquare && !lastBtnSquare) Serial2.println("F:E");
+            if (currTriangle && !lastBtnTriangle) Serial2.println("F:R");
+            if (currCross && !lastBtnCross) Serial2.println("F:S");
             lastBtnSquare = currSquare; lastBtnTriangle = currTriangle; lastBtnCross = currCross;
+
+            // --- 4. 保留：DC Motor 與 新 Servo 控制 (L2 / R2) ---
+            bool currL2 = PS4.L2();
+            bool currR2 = PS4.R2();
+            if (currL2 != lastBtnL2 || currR2 != lastBtnR2) {
+                if (currL2) {
+                    Serial2.println("D:170");
+                    if (currR2) Serial2.println("N:170"); else Serial2.println("N:100");
+                } else {
+                    Serial2.println("D:0");
+                    if (currR2) Serial2.println("N:170"); else Serial2.println("N:110");
+                }
+            }
+            lastBtnL2 = currL2; lastBtnR2 = currR2;
 
         } else {
             setTargetRPM(0, 0); 
@@ -176,91 +207,131 @@ void Task_Input(void *pvParameters) {
 
 // ================= 初始化 =================
 void setup() {
-  Serial.begin(115200);
-  Serial2.begin(115200, SERIAL_8N1, 15, 23);
+    Serial.begin(115200);
+    Serial2.begin(115200, SERIAL_8N1, 15, 23);
 
-  const int motorPins[] = {ENA_LF, IN1_LF, IN2_LF, ENB_LR, IN3_LR, IN4_LR, ENA_RF, IN1_RF, IN2_RF, ENB_RR, IN3_RR, IN4_RR};
-  for (int i = 0; i < 12; i++) { pinMode(motorPins[i], OUTPUT); digitalWrite(motorPins[i], LOW); }
+    const int motorPins[] = {ENA_LF, IN1_LF, IN2_LF, ENB_LR, IN3_LR, IN4_LR, ENA_RF, IN1_RF, IN2_RF, ENB_RR, IN3_RR, IN4_RR};
+    for (int i = 0; i < 12; i++) { 
+        pinMode(motorPins[i], OUTPUT); 
+        digitalWrite(motorPins[i], LOW); 
+    }
   
-  pinMode(ENCA_LF, INPUT_PULLUP); pinMode(ENCB_LF, INPUT);
-  pinMode(ENCA_LR, INPUT_PULLUP); pinMode(ENCB_LR, INPUT);
-  pinMode(ENCA_RF, INPUT_PULLUP); pinMode(ENCB_RF, INPUT);
-  pinMode(ENCA_RR, INPUT_PULLUP); pinMode(ENCB_RR, INPUT);
+    pinMode(ENCA_LF, INPUT_PULLUP); pinMode(ENCB_LF, INPUT);
+    pinMode(ENCA_LR, INPUT_PULLUP); pinMode(ENCB_LR, INPUT);
+    pinMode(ENCA_RF, INPUT_PULLUP); pinMode(ENCB_RF, INPUT);
+    pinMode(ENCA_RR, INPUT_PULLUP); pinMode(ENCB_RR, INPUT);
 
-  attachInterrupt(digitalPinToInterrupt(ENCA_LF), isrLF, RISING);
-  attachInterrupt(digitalPinToInterrupt(ENCA_LR), isrLR, RISING);
-  attachInterrupt(digitalPinToInterrupt(ENCA_RF), isrRF, RISING);
-  attachInterrupt(digitalPinToInterrupt(ENCA_RR), isrRR, RISING);
+    attachInterrupt(digitalPinToInterrupt(ENCA_LF), isrLF, RISING);
+    attachInterrupt(digitalPinToInterrupt(ENCA_LR), isrLR, RISING);
+    attachInterrupt(digitalPinToInterrupt(ENCA_RF), isrRF, RISING);
+    attachInterrupt(digitalPinToInterrupt(ENCA_RR), isrRR, RISING);
 
-  PS4.begin("70:4B:CA:57:BA:6A"); 
-  Serial.println("PS4 Controller Listening...");
+    PS4.begin("70:4B:CA:57:BA:6A"); 
+    Serial.println("PS4 Controller Listening...");
 
-  xTaskCreatePinnedToCore(Task_Input, "PS4InputTask", 4096, NULL, 2, NULL, 0);
+    xTaskCreatePinnedToCore(Task_Input, "PS4InputTask", 4096, NULL, 2, NULL, 0);
 }
 
 void loop() {
-  unsigned long currentMillis = millis();
-  if (currentMillis - previousMillis >= reportInterval) {
-    noInterrupts();
-    long dLF = countLF - prevCountLF; long dLR = countLR - prevCountLR;
-    long dRF = countRF - prevCountRF; long dRR = countRR - prevCountRR;
-    prevCountLF = countLF; prevCountLR = countLR; prevCountRF = countRF; prevCountRR = countRR;
-    interrupts();
+    unsigned long currentMillis = millis();
+    unsigned long dt_ms = currentMillis - previousMillis;
 
-    float mult = (60000.0 / reportInterval) / totalPPR;
-    float rpmLF = -dLF * mult; float rpmLR = -dLR * mult;
-    float rpmRF = dRF * mult;  float rpmRR = dRR * mult;
+    if (dt_ms >= reportInterval) {
+        float dt_sec = dt_ms / 1000.0f; //
 
-    if (abs(rpmLF) > 500) rpmLF = pidLF.filteredRPM;
-    if (abs(rpmLR) > 500) rpmLR = pidLR.filteredRPM;
-    if (abs(rpmRF) > 500) rpmRF = pidRF.filteredRPM;
-    if (abs(rpmRR) > 500) rpmRR = pidRR.filteredRPM;
+        noInterrupts();
+        long dLF = countLF - prevCountLF; 
+        long dLR = countLR - prevCountLR;
+        long dRF = countRF - prevCountRF; 
+        long dRR = countRR - prevCountRR;
+        prevCountLF = countLF; prevCountLR = countLR; 
+        prevCountRF = countRF; prevCountRR = countRR;
+        interrupts();
 
-    applyMotorPWM(computePID(pidLF, rpmLF), computePID(pidLR, rpmLR), computePID(pidRF, rpmRF), computePID(pidRR, rpmRR));
-    previousMillis = currentMillis;
+        float mult = (60.0f / dt_sec) / totalPPR;
+        float rpmLF = -dLF * mult; 
+        float rpmLR = -dLR * mult;
+        float rpmRF = dRF * mult;  
+        float rpmRR = dRR * mult;
 
-    // ================= Serial Plotter =================
-    Serial.printf("LF_RPM:%.2f, LR_RPM:%.2f, RF_RPM:%.2f, RR_RPM:%.2f\n", 
-                  pidLF.filteredRPM, pidLR.filteredRPM, pidRF.filteredRPM, pidRR.filteredRPM);
-  }
+        if (abs(rpmLF) > 500) rpmLF = pidLF.filteredRPM;
+        if (abs(rpmLR) > 500) rpmLR = pidLR.filteredRPM;
+        if (abs(rpmRF) > 500) rpmRF = pidRF.filteredRPM;
+        if (abs(rpmRR) > 500) rpmRR = pidRR.filteredRPM;
+
+        int finalLF, finalLR, finalRF, finalRR;
+
+        if (pidEnabled) {
+            // 閉迴路模式
+            finalLF = computePID(pidLF, rpmLF, dt_sec);
+            finalLR = computePID(pidLR, rpmLR, dt_sec);
+            finalRF = computePID(pidRF, rpmRF, dt_sec);
+            finalRR = computePID(pidRR, rpmRR, dt_sec);
+        } else {
+            // 開迴路模式
+            finalLF = constrain((pidLF.setpoint / MAX_RPM) * 255.0f, -255, 255);
+            finalLR = constrain((pidLR.setpoint / MAX_RPM) * 255.0f, -255, 255);
+            finalRF = constrain((pidRF.setpoint / MAX_RPM) * 255.0f, -255, 255);
+            finalRR = constrain((pidRR.setpoint / MAX_RPM) * 255.0f, -255, 255);
+        }
+
+        applyMotorPWM(finalLF, finalLR, finalRF, finalRR);
+        previousMillis = currentMillis;
+    }
 }
 
 // ================= PID 運算 =================
-int computePID(MotorPID &pid, float currentRPM) {
-  pid.filteredRPM = (0.8 * pid.filteredRPM) + (0.2 * currentRPM); 
+int computePID(MotorPID &pid, float currentRPM, float dt) {
+    pid.filteredRPM = (0.8f * pid.filteredRPM) + (0.2f * currentRPM); 
 
-  if (pid.setpoint == 0) { 
-    pid.integral = 0; 
-    pid.prevRPM = pid.filteredRPM; 
-    return 0; 
-  }
+    if (pid.setpoint == 0) { 
+        pid.integral = 0; 
+        pid.prevRPM = pid.filteredRPM; 
+        return 0; 
+    }
 
-  float error = pid.setpoint - pid.filteredRPM;
-  float dTerm = pid.kd * (pid.prevRPM - pid.filteredRPM);
-
-  float testOutput = (pid.kp * error) + (pid.ki * pid.integral) + dTerm;
+    float error = pid.setpoint - pid.filteredRPM;
+    float dTerm = pid.kd * (pid.prevRPM - pid.filteredRPM) / dt;
+    float pTerm = pid.kp * error;
+    float testOutput = pTerm + (pid.ki * pid.integral) + dTerm;
   
-  bool isSaturated = (testOutput >= 255 && error > 0) || (testOutput <= -255 && error < 0);
-  if (!isSaturated) {
-    pid.integral += error;
-  }
+    bool isSaturated = (testOutput >= 255 && error > 0) || (testOutput <= -255 && error < 0);
+    
+    if (!isSaturated) {
+        pid.integral += error * dt; 
+    }
   
-  pid.integral *= 0.98; 
+    pid.integral *= 0.98f; 
 
-  float output = (pid.kp * error) + (pid.ki * pid.integral) + dTerm;
-  pid.prevRPM = pid.filteredRPM;
+    float output = pTerm + (pid.ki * pid.integral) + dTerm;
+    pid.prevRPM = pid.filteredRPM;
   
-  return constrain((int)output, -255, 255);
+    return constrain((int)output, -255, 255);
 }
 
 void setTargetRPM(float leftRPM, float rightRPM) {
-  pidLF.setpoint = leftRPM; pidLR.setpoint = leftRPM;
-  pidRF.setpoint = rightRPM; pidRR.setpoint = rightRPM;
+    pidLF.setpoint = leftRPM; 
+    pidLR.setpoint = leftRPM;
+    pidRF.setpoint = rightRPM; 
+    pidRR.setpoint = rightRPM;
+}
+
+// ================= 馬達驅動 =================
+void setMotorPWM(int in1, int in2, int en, int pwm) {
+    if (pwm == 0) {
+        digitalWrite(in1, LOW);
+        digitalWrite(in2, LOW);
+        analogWrite(en, 0);
+    } else {
+        digitalWrite(in1, pwm > 0 ? HIGH : LOW);
+        digitalWrite(in2, pwm < 0 ? HIGH : LOW);
+        analogWrite(en, abs(pwm));
+    }
 }
 
 void applyMotorPWM(int pwmLF, int pwmLR, int pwmRF, int pwmRR) {
-  digitalWrite(IN1_LF, pwmLF > 0 ? HIGH : LOW); digitalWrite(IN2_LF, pwmLF < 0 ? HIGH : LOW); analogWrite(ENA_LF, abs(pwmLF));
-  digitalWrite(IN3_LR, pwmLR > 0 ? HIGH : LOW); digitalWrite(IN4_LR, pwmLR < 0 ? HIGH : LOW); analogWrite(ENB_LR, abs(pwmLR));
-  digitalWrite(IN1_RF, pwmRF > 0 ? HIGH : LOW); digitalWrite(IN2_RF, pwmRF < 0 ? HIGH : LOW); analogWrite(ENA_RF, abs(pwmRF));
-  digitalWrite(IN3_RR, pwmRR > 0 ? HIGH : LOW); digitalWrite(IN4_RR, pwmRR < 0 ? HIGH : LOW); analogWrite(ENB_RR, abs(pwmRR));
+    setMotorPWM(IN1_LF, IN2_LF, ENA_LF, pwmLF);
+    setMotorPWM(IN3_LR, IN4_LR, ENB_LR, pwmLR);
+    setMotorPWM(IN1_RF, IN2_RF, ENA_RF, pwmRF);
+    setMotorPWM(IN3_RR, IN4_RR, ENB_RR, pwmRR);
 }
